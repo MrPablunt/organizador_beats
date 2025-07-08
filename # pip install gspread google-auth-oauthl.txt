@@ -1,0 +1,175 @@
+﻿# -*- coding: utf-8 -*-
+import gspread
+from google.oauth2.service_account import Credentials
+import os 
+import librosa
+import soundfile as sf
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3NoHeaderError, ID3, TIT2, TPE1, TCON, TXXX
+import requests
+from googleapiclient.discovery import build
+
+# --- CONFIGURACIÓN CRÍTICA: ¡VERIFICAR CADA VALOR! ---
+# Ruta al archivo JSON de tus credenciales de Google Cloud
+# ¡ESTE ES EL NOMBRE EXACTO QUE ME DISTE, SIN EL .json AL FINAL, PARA VER SI ASÍ LO ENCUENTRA!
+SERVICE_ACCOUNT_FILE = 'braided-grammar-465202-t4-7894b7df3cb4' # <--- ¡CORRECCIÓN AQUÍ!
+
+# ID de tu Google Sheet 'Catálogo de Beats'
+# ¡Este ID es MUY SENSIBLE! Debe ser solo la parte del ID de la URL (entre /d/ y /edit).
+SPREADSHEET_ID = '19KvhoVYV0XIRZ3FfFTwBRPXjNSMyeAkFYUFl6I1kUEQ'
+# Nombre EXACTO de la pestaña/hoja dentro de tu Google Sheet. Normalmente es 'Hoja 1'.
+WORKSHEET_NAME = 'Hoja 1' 
+
+# ID de tu carpeta 'Nuevos Beats' en Google Drive (donde subes los beats a organizar)
+NUEVOS_BEATS_FOLDER_ID = '1fwLKWkWvn8TY6SSL7kQgaVtZ5olZFuyw'
+
+# ID de tu carpeta 'Beats organizados por género' en Google Drive (donde se crearán las subcarpetas de género)
+ORGANIZED_BEATS_PARENT_FOLDER_ID = '1nILKS4_YglgyLRuA_X6107N6ThMbsB8o'
+
+# --- CONFIGURACIÓN DE RUTAS LOCALES Y PERMISOS ---
+# Alcances (permisos) que tu robot necesita en Google
+SCOPE = [
+    'https://spreadsheets.google.com/feeds',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.file'
+]
+
+# Carpeta temporal en tu computadora para descargar y procesar beats
+# Se creará automáticamente si no existe.
+DOWNLOAD_TEMP_DIR = 'temp_beats_processing'
+if not os.path.exists(DOWNLOAD_TEMP_DIR):
+    try:
+        os.makedirs(DOWNLOAD_TEMP_DIR)
+    except OSError as e:
+        print(f"ERROR FATAL: No se pudo crear la carpeta temporal '{DOWNLOAD_TEMP_DIR}'. Mensaje: {e}")
+        print("VERIFICAR: Permisos de escritura en el escritorio o ruta del script.")
+        exit(1) # Salir del script si no se puede crear la carpeta temporal.
+
+# --- FIN DE CONFIGURACIÓN Y DECLARACIONES ---
+
+
+def authenticate_google():
+    """
+    Autentica con Google usando la cuenta de servicio.
+    Verifica que el archivo de credenciales exista y que los permisos sean correctos.
+    """
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        print(f"ERROR CRÍTICO DE AUTENTICACIÓN: El archivo de credenciales '{SERVICE_ACCOUNT_FILE}' NO SE ENCONTRÓ.")
+        print("POSIBLE SOLUCIÓN: ")
+        print("  1. Verifica que el nombre del archivo en 'SERVICE_ACCOUNT_FILE' (línea 15 del script) es EXACTO.")
+        print("  2. Asegúrate de que el archivo JSON está en la MISMA CARPETA que este script.")
+        print("  3. Si lo guardaste en otro lugar, pon la RUTA COMPLETA al archivo en la línea 15.")
+        return None, None, None
+
+    try:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPE)
+        gc = gspread.authorize(creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        return gc, drive_service, creds
+    except Exception as e:
+        print(f"ERROR CRÍTICO DE AUTENTICACIÓN: Falló la conexión con Google. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: ")
+        print("  1. El archivo JSON puede estar corrupto o incorrecto.")
+        print("  2. La CUENTA DE SERVICIO (el email que termina en @gserviceaccount.com) NO TIENE PERMISOS de 'Editor' en:")
+        print(f"     - La Google Sheet (ID: {SPREADSHEET_ID})")
+        print(f"     - La carpeta 'Nuevos Beats' (ID: {NUEVOS_BEATS_FOLDER_ID})")
+        print(f"     - La carpeta 'Beats organizados por género' (ID: {ORGANIZED_BEATS_PARENT_FOLDER_ID})")
+        print("  3. Las APIs de 'Google Drive API' y 'Google Sheets API' NO están HABILITADAS en tu proyecto de Google Cloud.")
+        return None, None, None
+
+def get_sheet_data(gc, spreadsheet_id, worksheet_name):
+    """Obtiene todos los datos de la hoja de cálculo. Maneja errores de acceso."""
+    try:
+        spreadsheet = gc.open_by_key(spreadsheet_id)
+        worksheet = spreadsheet.worksheet(worksheet_name)
+        return worksheet, worksheet.get_all_records(), worksheet.row_values(1)
+    except gspread.exceptions.SpreadsheetNotFound:
+        print(f"ERROR: La Google Sheet con ID '{spreadsheet_id}' NO FUE ENCONTRADA.")
+        print("POSIBLE SOLUCIÓN: Verifica que el 'SPREADSHEET_ID' en la línea 12 del script sea CORRECTO y la hoja exista.")
+        print("  Asegúrate de que la CUENTA DE SERVICIO tiene permisos de 'Editor' en esa Google Sheet.")
+        return None, None, None
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"ERROR: La hoja '{worksheet_name}' NO FUE ENCONTRADA dentro de la Google Sheet.")
+        print("POSIBLE SOLUCIÓN: Verifica que el 'WORKSHEET_NAME' en la línea 13 del script sea el nombre EXACTO de la pestaña de tu hoja (ej. 'Hoja 1' o 'MiCatalogo').")
+        return None, None, None
+    except Exception as e:
+        print(f"ERROR: No se pudo acceder a la hoja de cálculo. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: Podría ser un problema de permisos. Asegúrate de que la CUENTA DE SERVICIO tiene permisos de 'Editor' en la Google Sheet.")
+        return None, None, None
+
+def update_sheet_row(worksheet, row_index, column_name, new_value, headers):
+    """Actualiza una celda específica en la hoja de cálculo. Maneja errores de columna y API."""
+    try:
+        col_index = headers.index(column_name) + 1 # gspread usa 1-based indexing
+        worksheet.update_cell(row_index, col_index, new_value)
+    except ValueError:
+        print(f"ADVERTENCIA: Columna '{column_name}' no encontrada en la hoja para la fila {row_index}. La información no se guardó para esta columna.")
+        print("POSIBLE SOLUCIÓN: Verifica que el nombre de la columna en tu Google Sheet es EXACTO (incluyendo mayúsculas/minúsculas y espacios).")
+    except Exception as e:
+        print(f"ERROR: No se pudo actualizar la celda en la fila {row_index}, columna '{column_name}'. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: Podría ser un problema de conexión o cuota de la API de Google Sheets.")
+
+def get_drive_file_info(drive_service, folder_id):
+    """Obtiene información de los archivos en una carpeta de Google Drive. Maneja errores de acceso."""
+    try:
+        files_info = {}
+        query = f"'{folder_id}' in parents and trashed = false"
+        results = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
+        items = results.get('files', [])
+        for item in items:
+            files_info[item['name']] = {'id': item['id'], 'mimeType': item['mimeType']}
+        return files_info
+    except Exception as e:
+        print(f"ERROR: No se pudo acceder a la carpeta de Google Drive con ID '{folder_id}'. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: Verifica que el ID de la carpeta es CORRECTO y la CUENTA DE SERVICIO tiene permisos de 'Editor' en esa carpeta.")
+        return {}
+
+def download_file(drive_service, file_id, file_name, destination_folder):
+    """Descarga un archivo de Google Drive a una carpeta local. Maneja errores de descarga."""
+    filepath = os.path.join(destination_folder, file_name)
+    try:
+        # Usamos requests para una descarga más robusta que la de googleapiclient.get_media() directamente
+        download_url = drive_service.files().get_media(fileId=file_id).uri
+        response = requests.get(download_url, headers={'Authorization': f'Bearer {drive_service.credentials.token}'}, stream=True)
+        response.raise_for_status() # Lanza un HTTPError si la descarga falla (ej. 404, 500)
+        
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk: # filtrar keep-alive new chunks
+                    f.write(chunk)
+        return filepath
+    except requests.exceptions.HTTPError as err:
+        print(f"ERROR DE DESCARGA HTTP para '{file_name}' (ID: {file_id}). Código: {err.response.status_code}. Mensaje: {err.response.text}")
+        print("POSIBLE SOLUCIÓN: El archivo no existe en Drive (ID incorrecto) o hay un problema temporal de Google Drive.")
+        return None
+    except requests.exceptions.ConnectionError as err:
+        print(f"ERROR DE CONEXIÓN al descargar '{file_name}'. Mensaje: {err}")
+        print("POSIBLE SOLUCIÓN: Problemas de conexión a internet o firewall bloqueando la conexión.")
+        return None
+    except Exception as e:
+        print(f"ERROR GENERAL al descargar '{file_name}'. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: Verificar permisos de escritura en la carpeta temporal.")
+        return None
+
+def analyze_audio(filepath):
+    """Analiza un archivo de audio para BPM y clave usando Librosa. Maneja errores de Librosa."""
+    if not filepath: # Si la descarga falló, filepath será None
+        return "N/A", "N/A"
+    try:
+        y, sr = librosa.load(filepath, sr=None) # sr=None para usar la tasa de muestreo original
+        
+        onset_env = librosa.onset.onset_detect(y=y, sr=sr)
+        tempo, _ = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
+        
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        key_mode = librosa.key_to_notes(librosa.feature.tonnetz(y=y, sr=sr).mean(axis=1))
+        
+        return round(tempo), key_mode[0] if key_mode else "N/A"
+    except Exception as e:
+        print(f"ERROR DE ANÁLISIS DE AUDIO: Falló el análisis de '{filepath}'. Mensaje: {e}")
+        print("POSIBLE SOLUCIÓN: Asegúrate de que el archivo no está corrupto o es de un formato soportado por Librosa (MP3, WAV, FLAC).")
+        return "N/A", "N/A"
+
+def update_audio_metadata(filepath, title, artist, genre, bpm, key):
+    """
+    Actualiza los metadatos (ID3
