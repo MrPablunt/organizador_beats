@@ -1,3 +1,15 @@
+# Node modules
 node_modules/
-server.log
-package-lock.json
+
+# Environment files
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Analysis results
+analysis.csv
+
+# OS files
+.DS_Store
